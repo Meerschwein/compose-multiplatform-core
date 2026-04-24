@@ -14,405 +14,765 @@
  * limitations under the License.
  */
 
+@file:OptIn(
+    ExperimentalComposeUiApi::class,
+    InternalComposeUiApi::class,
+    ExperimentalWasmJsInterop::class,
+)
+
+
 package androidx.compose.ui.platform.accessibility
 
-import androidx.collection.MutableScatterMap
-import androidx.compose.ui.currentTimeMillis
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.InternalComposeUiApi
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.PlatformContext
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsActions
-import androidx.compose.ui.semantics.SemanticsConfiguration
 import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsOwner
 import androidx.compose.ui.semantics.SemanticsProperties
-import androidx.compose.ui.util.fastForEach
-import androidx.compose.ui.util.fastJoinToString
+import androidx.compose.ui.semantics.SemanticsPropertyKey
+import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.state.ToggleableState
+import kotlin.js.ExperimentalWasmJsInterop
+import kotlin.js.JsAny
+import kotlin.js.JsNumber
+import kotlin.js.definedExternally
 import kotlin.js.js
+import kotlin.js.toDouble
+import kotlin.js.toJsNumber
+import kotlin.js.unsafeCast
 import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.browser.document
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
+import org.w3c.dom.AddEventListenerOptions
+import org.w3c.dom.HTMLButtonElement
+import org.w3c.dom.HTMLCanvasElement
+import org.w3c.dom.HTMLDivElement
 import org.w3c.dom.HTMLElement
+import org.w3c.dom.HTMLInputElement
+import org.w3c.dom.HTMLProgressElement
+import org.w3c.dom.Node
+import org.w3c.dom.NodeList
+import org.w3c.dom.events.Event
+import org.w3c.dom.events.EventListener as EventListenerInterface
+import org.w3c.dom.events.EventTarget
+import org.w3c.dom.events.InputEvent
+import org.w3c.dom.events.InputEventInit
+import org.w3c.dom.events.KeyboardEvent
 
 internal class ComposeWebSemanticsListener(
     val coroutineScope: CoroutineScope,
     val webSemanticsRoot: HTMLElement,
 ) : PlatformContext.SemanticsOwnerListener {
+    private val owners = mutableSetOf<SemanticsOwner>()
 
-    private val invalidationChannel =
-        Channel<Unit>(1, onBufferOverflow = BufferOverflow.DROP_LATEST)
-    private val syncTriggerChannel =
-        Channel<Long>(1, onBufferOverflow = BufferOverflow.DROP_LATEST)
+    private val canvas =
+        webSemanticsRoot.previousElementSibling?.previousElementSibling as? HTMLCanvasElement
+    private val backingDomDiv = webSemanticsRoot.previousElementSibling as? HTMLDivElement
 
-    private companion object {
-        const val MAX_TIME_IN_DEBOUNCE_MS = 1000L
-        const val DEBOUNCE_MS = 100L
-    }
+    private val syncFlow =
+        MutableSharedFlow<Unit>(
+            replay = 1,
+            extraBufferCapacity = 1,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
+
+    private val eventHandlerCaller = canvas?.let(::EventHandlerCaller)
+
+    private var preventFocus = false
 
     init {
-        // Here we do the following:
-        // - Every invalidation doesn't trigger an a11y tree sync immediately, but only after the changes have settled (debounce 100ms).
-        // - We track the time spent in "debounce", so eventually it must sync the a11y tree despite no pause in invalidation events (the changes couldn't settle).
-        // So the a11y tree sync will happen either when the changes have settled or when the timeSpentInDebounce exceeds 1000 ms.
 
-        /*
-              1) --x-x-x-x-------------------------------------------------
-                         |--- 100ms ---| -> sync after changes settle
+        // every browser other than Chrome needs this attribute in order for copy/paste events to be sendable to the
+        // canvas. In Chrome however setting this results in copy/paste no longer working.
+        if (!isChrome())
+            canvas?.setAttribute("contenteditable", "true")
 
-              2) ---x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x-x--
-                    |-------- 1000ms -------| spent 1 second debouncing
-                                            |-> forced sync
+        webSemanticsRoot.removeAttribute("aria-live")
+        webSemanticsRoot.setAttribute("role", "application")
 
-              3) ----------------------------x-x-x-x-x-x-x-x---------------
-                 |---------- 1200ms ---------|             |--- 100 ms ---| -> sync after changes settle
-                                             | No forced sync here, because the debouncing has just started
-         */
+
+        backingDomDiv?.addEventListener(
+            "keydown",
+            { event ->
+                if (event is KeyboardEvent) {
+                    // We prevent focus right before a copy, paste or cut event to prevent it from being send to
+                    // the wrong HtmlElement (The Shadow Element) and thus being ignored.
+                    if (isClipboardEventTrigger(event)) {
+                        preventFocus = true
+                    }
+                }
+            },
+            AddEventListenerOptions(capture = true),
+        )
+
+        webSemanticsRoot.addEventListener(
+            "keydown",
+            { event ->
+                // we need to prevent the default (moving focus) on these keys because we handle it ourselves
+                if (event is KeyboardEvent && listOf(
+                        "ArrowLeft",
+                        "ArrowRight",
+                        "ArrowDown",
+                        "ArrowUp",
+                        "Tab"
+                    ).contains(event.key)
+                ) event.preventDefault()
+
+                val backingInputField =
+                    backingDomDiv?.querySelector("input, textarea") as? HTMLElement
+                // If the backingInputField exists and we send keydown events to the canvas,
+                // they might get processed in the wrong order, because the canvas's EventHandler does not care about event.timeStamp
+                if (backingInputField == null) {
+                    eventHandlerCaller?.callWithEvent(event)
+                } else {
+                    if (event is KeyboardEvent) {
+                        // We prevent focus right before a copy, paste or cut event to prevent it from being send to the wrong HtmlElement (The Shadow Element)
+                        // and thus being ignored. Redispatching doesn't work because of the isTrusted flag (it might honestly also be other browser code magic)
+                        if (isClipboardEventTrigger(event)) {
+                            preventFocus = true
+                            backingInputField.focus()
+                        }
+
+                        // If there is a backing textarea or input field, then compose always intends for keydown and keyup events to go to it.
+                        // Redispatching them works, because we are only interested in triggering
+                        // the custom Event Handler in androidx.compose.ui.platform.DomInputStrategy
+                        backingInputField.dispatchEvent(
+                            copyKeyboardEvent(event).also {
+                                setEventTimestamp(
+                                    it,
+                                    event.timeStamp.toDouble().toJsNumber()
+                                )
+                            })
+                    }
+                }
+            },
+            AddEventListenerOptions(capture = true),
+        )
+
+        webSemanticsRoot.addEventListener(
+            "keyup",
+            { event ->
+                val backingInputField =
+                    backingDomDiv?.querySelector("input, textarea") as? HTMLElement
+                if (backingInputField == null) {
+                    eventHandlerCaller?.callWithEvent(event)
+                } else {
+                    if (event is KeyboardEvent) {
+                        backingInputField.dispatchEvent(
+                            copyKeyboardEvent(event).also {
+                                setEventTimestamp(
+                                    it,
+                                    event.timeStamp.toDouble().toJsNumber()
+                                )
+                            })
+                    }
+                }
+            },
+            AddEventListenerOptions(capture = true),
+        )
+
+        // We never have to send copy, paste and cut events to the canvas, as there are no listeners for them
+        //for (type in listOf("copy", "paste", "cut")) webSemanticsRoot.addEventListener(
+        //    type,
+        //    EventListener { event ->
+        //        // Do nothing
+        //    },
+        //    AddEventListenerOptions(capture = true),)
+
+        for (type in listOf("copy", "paste", "cut")) document.addEventListener(
+            type,
+            { _ ->
+                // Once a copy, paste or cut event has been send, we no longer need to prevent focus
+                preventFocus = false
+            },
+            AddEventListenerOptions(capture = false)
+        ) //Needs to only trigger when bubbling back up
+
+        webSemanticsRoot.addEventListener(
+            "beforeinput",
+            { event ->
+                event.preventDefault()
+                if (event is InputEvent) {
+                    // Redispatching beforeinput events works despite the new event being not trusted,
+                    // because we are only interested in triggering the custom Event Handler in androidx.compose.ui.platform.DomInputStrategy
+                    (backingDomDiv?.querySelector("input, textarea") as? HTMLElement)?.dispatchEvent(
+                        copyInputEvent(event).also {
+                            setEventTimestamp(it, event.timeStamp.toDouble().toJsNumber())
+                        }
+                    )
+                }
+            },
+            AddEventListenerOptions(capture = true),
+        )
+
         coroutineScope.launch {
-            var timeSpentDebouncing = 0L
-            var lastDebouncedTime = 0L
-            var lastSyncTime = currentTimeMillis()
-
-            launch {
-                invalidationChannel.receiveAsFlow().collect {
-                    val currentTime = currentTimeMillis()
-
-                    if (lastDebouncedTime == 0L) {
-                        lastDebouncedTime = currentTime
-                        timeSpentDebouncing = 0L
-                    } else {
-                        val delta = currentTime - lastDebouncedTime
-                        timeSpentDebouncing += delta
-                        lastDebouncedTime = currentTime
-                    }
-
-                    if (timeSpentDebouncing >= MAX_TIME_IN_DEBOUNCE_MS) {
-                        // we've been debouncing for too long, but must sync periodically, so force a sync
-                        lastDebouncedTime = 0L
-                        lastSyncTime = currentTime
-                        syncSemanticsWithWebA11Y()
-                    } else {
-                        syncTriggerChannel.trySend(currentTime)
+            syncFlow
+                .conflate()
+                .collect {
+                    for (owner in owners) {
+                        onSemanticsChangeInner(owner)
                     }
                 }
-            }
+        }
 
-            @OptIn(FlowPreview::class)
-            launch {
-                // debounce until the Semantics changes settled for at least 100ms
-                syncTriggerChannel.receiveAsFlow().debounce(DEBOUNCE_MS.milliseconds).collect {
-                    val currentTime = currentTimeMillis()
-
-                    // syncSemanticsWithWebA11Y could've been triggered from a "force sync" above,
-                    // so we check the lastSyncTime here
-                    if (currentTime - lastSyncTime >= DEBOUNCE_MS) {
-                        lastDebouncedTime = 0L
-                        lastSyncTime = currentTime
-                        syncSemanticsWithWebA11Y()
-                    }
-                }
+        coroutineScope.launch {
+            while (true) {
+                syncFlow.emit(Unit)
+                delay(100.milliseconds)
             }
         }
     }
 
-    private var semanticsOwner: SemanticsOwner? = null
+    internal val SemanticsOwner.semanticId: String get() = "cmp-semantic-${rootSemanticsNode.id}"
+    internal val SemanticsNode.semanticId: String get() = "cmp-semantic-$id"
 
     override fun onSemanticsOwnerAppended(semanticsOwner: SemanticsOwner) {
-        this.semanticsOwner = semanticsOwner
+        if (findElement(semanticsOwner) != null) return
+
+        val ownerElement = document.createElement("div") as HTMLDivElement
+
+        ownerElement.setAttribute("id", semanticsOwner.semanticId)
+
+        webSemanticsRoot.appendChild(ownerElement)
+        owners.add(semanticsOwner)
     }
 
     override fun onSemanticsOwnerRemoved(semanticsOwner: SemanticsOwner) {
-        if (semanticsOwner == this.semanticsOwner) {
-            this.semanticsOwner = null
-        }
+        val element = checkNotNull(findElement(semanticsOwner)) { "owner does not exist" }
+
+        element.remove()
+        owners.remove(semanticsOwner)
     }
 
     override fun onSemanticsChange(semanticsOwner: SemanticsOwner) {
-        invalidationChannel.trySend(Unit)
+        syncFlow.tryEmit(Unit)
     }
 
-    override fun onLayoutChange(
-        semanticsOwner: SemanticsOwner, semanticsNodeId: Int
-    ) {
-        invalidationChannel.trySend(Unit)
-    }
+    fun onSemanticsChangeInner(semanticsOwner: SemanticsOwner) {
+        val queue = ArrayDeque(listOf(semanticsOwner.rootSemanticsNode))
+        val parent = findElement(semanticsOwner) ?: return
+        val currentIds = collectIds(parent)
+        val seen = mutableSetOf<String>()
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            when (val found = findElement(node)) {
+                null -> {
+                    // the node does not exist we need to create a new one
+                    if (node.config.getOrNull(SemanticsProperties.HideFromAccessibility) != null)
+                        continue
 
-    private val dfsDeque = ArrayDeque<SemanticsNode>()
+                    val el = basicHTMLElement(node)
+                    setAttrs(el, node)
 
-    private val nodes = MutableScatterMap<Int, SemanticsNode>()
-    private val nodeToParent = MutableScatterMap<Int, Int>()
-    private val webNodes = MutableScatterMap<Int, HTMLElement>()
+                    val parentElement = node.parent?.let(::findElement) ?: webSemanticsRoot
+                    val nextElement = node.parent?.let {
+                        val index =
+                            it.replacedChildren.indexOf(node).takeIf { it >= 0 } ?: return@let null
+                        it.replacedChildren.getOrNull(index + 1)?.let(::findElement)
+                    }
 
+                    if (nextElement != null) {
+                        parentElement.insertBefore(el, nextElement)
+                    } else {
+                        parentElement.appendChild(el)
+                    }
+                }
 
-    private fun syncSemanticsWithWebA11Y() {
-        fun SemanticsNode.isValid() = layoutNode.let { it.isPlaced && it.isAttached }
+                else -> {
+                    if (node.config.getOrNull(SemanticsProperties.HideFromAccessibility) != null)
+                        continue
 
-        val root = semanticsOwner?.rootSemanticsNode ?: return
+                    // the node does exist, however on the first render the node typically does not have a role
+                    // so on the first render we put in a div and later on need to replace it with the correct element.
+                    val el = basicHTMLElement(node)
+                    if (found.tagName != el.tagName) {
+                        setAttrs(el, node)
+                        found.replaceWith(el)
+                    } else {
+                        setAttrs(found, node)
+                    }
+                }
+            }
 
-        if (root.isValid()) {
-            dfsDeque.addLast(root)
+            seen.add(node.semanticId)
+            queue.addAll(node.replacedChildren)
         }
 
+        val unseen = currentIds - seen
 
-        val allIds = mutableSetOf<Int>()
+        for (id in unseen) {
+            findElement(id)?.remove()
+        }
+    }
+
+    override fun onLayoutChange(semanticsOwner: SemanticsOwner, semanticsNodeId: Int) {}
+
+    private fun findElement(
+        owner: SemanticsOwner,
+        parent: HTMLElement = webSemanticsRoot
+    ): HTMLElement? =
+        findElement(owner.semanticId, parent)
+
+    private fun findElement(
+        node: SemanticsNode,
+        parent: HTMLElement = webSemanticsRoot
+    ): HTMLElement? =
+        findElement(node.semanticId, parent)
+
+    private fun findElement(
+        semanticsId: String,
+        parent: HTMLElement = webSemanticsRoot
+    ): HTMLElement? =
+        parent.querySelector("[id='$semanticsId']") as HTMLElement?
+
+    private fun collectIds(parent: HTMLElement): Set<String> {
+        return parent.querySelectorAll("[id]")
+            .asSequence()
+            .map { it as HTMLElement }
+            .map { it.getAttribute("id") }
+            .filterNotNull()
+            .toSet()
+    }
+
+    private fun basicHTMLElement(node: SemanticsNode): HTMLElement {
+        return document.createElement(
+            when (node.config.getOrNull(SemanticsProperties.Role)) {
+                Role.Button -> "button"
+                Role.Checkbox -> "input"
+                Role.Switch -> "button"
+                Role.RadioButton -> "input"
+                Role.Tab -> "div"
+                Role.Image -> "div"
+                Role.DropdownList -> when (node.config.getOrNull(SemanticsProperties.IsEditable)) {
+                    true -> "input"
+                    else -> "button"
+                }
+
+                Role.ValuePicker -> "div"
+                Role.Carousel -> "div"
+                else -> {
+                    when {
+                        node.config.getOrNull(SemanticsProperties.ProgressBarRangeInfo) != null ->
+                            "progress"
+
+                        node.config.getOrNull(SemanticsProperties.IsEditable) != null ->
+                            "input"
+
+                        else -> "div"
+                    }
+                }
+            }
+        ) as HTMLElement
+    }
+
+    private fun setAttrs(el: HTMLElement, node: SemanticsNode) {
+        fun <T> setIf(attr: String, prop: SemanticsPropertyKey<T>, value: (T) -> String?) =
+            node.config.getOrNull(prop)?.let {
+                val v = value(it) ?: return@let null
+                if (el.getAttribute(attr) != v)
+                    el.setAttribute(attr, v)
+            }
+
+        fun setIf(attr: String, prop: SemanticsPropertyKey<String>) = setIf(attr, prop) { it }
+
+        fun <T> doIf(prop: SemanticsPropertyKey<T>, value: (T) -> Unit) =
+            node.config.getOrNull(prop)?.let { value(it) }
+
+        el.setAttribute("id", node.semanticId)
+
+        el.style.position = "fixed"
+        el.style.whiteSpace = "pre"
 
         val rootPosition = webSemanticsRoot.getBoundingClientRect().let {
             Offset(it.left.toFloat(), it.top.toFloat())
         }
 
-        while (!dfsDeque.isEmpty()) {
-            val node = dfsDeque.removeLast()
-            val currentId = node.id
-            allIds.add(currentId)
+        val density = node.layoutInfo.density.density
+        val toRoot = node.layoutInfo.coordinates.localToRoot(rootPosition).div(density)
+        val size = node.boundsInRoot.size.div(density)
 
-            val children = node.replacedChildren.asReversed()
-            dfsDeque.addAll(children)
-            children.fastForEach { it -> nodeToParent[it.id] = currentId }
+        el.style.left = "${toRoot.x}px"
+        el.style.top = "${toRoot.y}px"
+        el.style.width = "${size.width}px"
+        el.style.height = "${size.height}px"
 
-            val htmlNode = if (nodes[currentId] != null) {
-                nodes[currentId] = node
-                val htmlNode = webNodes[currentId] ?: error("Node $currentId not found")
+        setIf("data-test-tag", SemanticsProperties.TestTag)
 
-                if (children.isNotEmpty()) {
-                    // To ensure the correct order of nested nodes, we remove all of them.
-                    // I assume it's more efficient to remove and re-add them than to insert the nodes at specific positions.
-                    // Also, the code is more simple with this approach.
-                    // They are added below.
-                    removeAllChildrenOf(htmlNode)
+        when (node.config.getOrNull(SemanticsProperties.Role)) {
+            Role.DropdownList -> {
+                // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/combobox_role
+                el.setAttribute("role", "combobox")
+                setIf("type", SemanticsProperties.IsEditable) { // text field
+                    if (it) "text" else null
+                }
+                setIf("aria-expanded", SemanticsActions.Expand) { "false" }
+                setIf("aria-expanded", SemanticsActions.Collapse) { "true" }
+            }
+
+            Role.RadioButton -> {
+                el.setAttribute("type", "radio")
+                setIf("aria-label", SemanticsProperties.Text) { it.joinToString() }
+                doIf(SemanticsProperties.Selected) { el.checked = it }
+            }
+
+            Role.Checkbox -> {
+                require(el is HTMLInputElement) { "Role.Checkbox is not HTMLInputElement" }
+                el.setAttribute("type", "checkbox")
+                setIf("aria-label", SemanticsProperties.Text) { it.joinToString() }
+                doIf(SemanticsProperties.Selected) { el.checked = it }
+                doIf(SemanticsProperties.ToggleableState) { el.checked = it == ToggleableState.On }
+            }
+
+            Role.Button -> {
+                doIf(SemanticsProperties.Text) {
+                    val text = it.joinToString()
+                    if (el.innerText != text) el.innerText = text
+                }
+                setIf("aria-expanded", SemanticsActions.Expand) { "false" }
+                setIf("aria-expanded", SemanticsActions.Collapse) { "true" }
+            }
+
+            Role.Switch -> {
+                // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/switch_role
+                require(el is HTMLButtonElement) { "Role.Switch is not HTMLButtonElement" }
+                el.setAttribute("role", "switch")
+                setIf("aria-label", SemanticsProperties.Text) { it.joinToString() }
+                setIf("aria-checked", SemanticsProperties.Selected) { it.toString() }
+                setIf("aria-checked", SemanticsProperties.ToggleableState) {
+                    when (it) {
+                        ToggleableState.On -> "true"
+                        ToggleableState.Off -> "false"
+                        ToggleableState.Indeterminate -> "false"
+                    }
+                }
+            }
+
+            else -> {
+                // ThemedAdaptiveDialog sets this paneTitle
+                val isDialog = node.config.getOrNull(SemanticsProperties.IsDialog) != null ||
+                    node.config.getOrNull(SemanticsProperties.PaneTitle) == "Dialog"
+                if (isDialog) {
+                    el.setAttribute("role", "dialog")
+                    // find a header node and mark it as the label and mark its sibling (if it exists) as the description
+                    var hasHeadingAsChild: SemanticsNode? = node
+                    while (hasHeadingAsChild != null) {
+                        if (hasHeadingAsChild.children.getOrNull(0)?.config?.getOrNull(
+                                SemanticsProperties.Heading
+                            ) != null
+                        )
+                            break
+                        hasHeadingAsChild = hasHeadingAsChild.children.getOrNull(0)
+                    }
+                    if (hasHeadingAsChild != null) {
+                        hasHeadingAsChild.children.getOrNull(0)?.let {
+                            el.setAttribute("aria-labelledby", it.semanticId)
+                        }
+                        hasHeadingAsChild.children.getOrNull(1)?.let {
+                            el.setAttribute("aria-describedby", it.semanticId)
+                        }
+                    }
                 }
 
-                syncNode(node, htmlNode, rootPosition)
-                htmlNode
-            } else {
-                nodes[currentId] = node
-                val htmlNode = document.createElement("div") as HTMLElement
-                htmlNode.style.apply {
-                    position = "fixed"
-                    whiteSpace = "pre"
+                setIf("aria-label", SemanticsProperties.Text, { it.joinToString() })
+                // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/textbox_role
+                // https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/input/text
+
+                if (node.config.getOrNull(SemanticsProperties.IsEditable) != null && el is HTMLInputElement) {
+                    el.setAttribute("type", "text")
+                    setIf("aria-description", SemanticsProperties.InputText) { it.toString() }
+                    el.removeAttribute("readonly")
+                    if (node.config.getOrNull(SemanticsActions.SetText) == null)
+                        el.setAttribute("readonly", "")
+                }
+            }
+        }
+
+        node.config.getOrNull(SemanticsProperties.ProgressBarRangeInfo)?.let {
+            require(
+                el is HTMLProgressElement,
+                { "node with ProgressBarRangeInfo is not HTMLProgressElement" })
+            el.setAttribute("value", it.current.toString())
+            el.setAttribute("max", it.range.endInclusive.toString())
+        }
+
+        fun areAllChildrenRadioButtons(node: SemanticsNode): Boolean {
+            val innerStack = ArrayDeque(listOf(node))
+
+            var hasRadioChild = false
+
+            while (innerStack.isNotEmpty()) {
+                val current = innerStack.removeFirst()
+
+                val role = current.config.getOrNull(SemanticsProperties.Role)
+
+                if (role != null && role != Role.RadioButton) return false
+                if (role == Role.RadioButton) hasRadioChild = true
+
+                innerStack.addAll(current.replacedChildren)
+            }
+
+            return hasRadioChild
+        }
+
+        setIf("role", SemanticsProperties.CollectionInfo) {
+            if (areAllChildrenRadioButtons(node)) "radiogroup" else null
+        }
+
+        val clickable = node.config.getOrNull(SemanticsActions.OnClick) != null
+        if (clickable) {
+            if (el.clickListener == null) {
+                el.clickListener = EventListener {
+                    doIf(SemanticsActions.OnClick) { it.action?.invoke() }
+                }
+            }
+        } else {
+            el.clickListener = null
+        }
+
+        // TODO: Logic
+        // When either RequestFocus or Focused is set, the shadow dom element has to be focusable (e.g. via tabindex or similar)
+        // On focus, we have to actually focus the shadow dom element for the screen reader to actually read the text
+        // For this to properly work with the handlers from compose, we have to propagate keyboard events, the actual focus
+        // event and click events back to the canvas or to the explicit handlers, if they are given.
+        val focusable = node.config.getOrNull(SemanticsProperties.Focused) != null
+            || node.config.getOrNull(SemanticsActions.RequestFocus) != null
+        if (focusable) {
+            if (el.focusListener == null) {
+                val focusListener = EventListener {
+                    doIf(SemanticsActions.RequestFocus) { it.action?.invoke() }
                 }
 
-                webNodes[currentId] = htmlNode
-                syncNode(node, htmlNode, rootPosition, true)
-                htmlNode
+                if (el is HTMLDivElement)
+                    el.setAttribute("tabindex", "-1")
+
+                el.focusListener = focusListener
             }
-
-            // find the parent node and attach to it
-            val parentId = nodeToParent[currentId]
-            val htmlParent = parentId?.let { webNodes[it] } ?: webSemanticsRoot
-            htmlParent.appendChild(htmlNode)
+        } else {
+            el.removeAttribute("tabindex")
+            el.focusListener = null
         }
 
-        val removedIds = mutableSetOf<Int>()
-
-        webNodes.forEachKey {
-            if (it !in allIds) {
-                webNodes[it]?.remove()
-                removedIds.add(it)
-            }
-        }
-
-        removedIds.forEach { webNodes.remove(it) }
-    }
-
-    private fun syncNode(
-        sn: SemanticsNode,
-        htmlNode: HTMLElement,
-        rootOffset: Offset,
-        justCreated: Boolean = false,
-    ) {
-        val config = sn.config
-
-        if (config.contains(SemanticsProperties.Text)) {
-            val text = config[SemanticsProperties.Text]
-            htmlNode.innerText = text.fastJoinToString("\n") { it.text }
-        }
-
-        if (config.contains(SemanticsProperties.ContentDescription)) {
-            val contentDescription = config[SemanticsProperties.ContentDescription]
-            htmlNode.setAttribute("aria-label", contentDescription.fastJoinToString(", "))
-        }
-
-        if (config.contains(SemanticsActions.OnClick) && justCreated) {
-            val listener = config[SemanticsActions.OnClick].action!!
-
-            // TODO: need to remove the click listener when the new config version doesn't have OnClick action
-            htmlNode.addEventListener("click", {
-                listener.invoke()
-            })
-        }
-
-        if (config.contains(SemanticsProperties.TestTag)) {
-            val testTag = config[SemanticsProperties.TestTag]
-            htmlNode.id = testTag
-        }
-
-        if (config.contains(SemanticsProperties.EditableText)) {
-            val text = config[SemanticsProperties.EditableText].text
-            htmlNode.innerText = text
-
-            if (justCreated) {
-                htmlNode.setAttribute("contenteditable", "true")
-                htmlNode.addEventListener("focus", {
-                    htmlNode.click()
-                })
+        doIf(SemanticsProperties.Focused) {
+            if (it) {
+                if (!preventFocus) {
+                    // It is not enough for textboxes to just have focus they also need to be clicked.
+                    // This is the same workaround as upstream.
+                    doIf(SemanticsProperties.EditableText) { el.click() }
+                    el.focus()
+                }
             }
         }
 
-        setA11YAriaRole(element = htmlNode, config.getRoleId())
+        el.removeAttribute("aria-live")
+        setIf("aria-live", SemanticsProperties.LiveRegion) {
+            when (it) {
+                LiveRegionMode.Polite -> "polite"
+                LiveRegionMode.Assertive -> "assertive"
+                else -> "off"
+            }
+        }
 
-        val density = sn.layoutNode.density
-        sn.boundsInRoot.let { rect ->
-            val newPosition = rootOffset + rect.topLeft.div(density.density)
-            val width = rect.width.div(density.density)
-            val height = rect.height.div(density.density)
+        setIf("aria-description", SemanticsProperties.ContentDescription) { it.joinToString() }
 
-            setSizeAndPosition(htmlNode, newPosition.x, newPosition.y, width, height)
+        val title = node.config.getOrNull(SemanticsProperties.PaneTitle)
+        if (title != null) {
+            el.setAttribute("title", title)
+            if (title == "tooltip")
+                el.setAttribute("role", "tooltip")
         }
     }
 }
 
-private fun setSizeAndPosition(
-    element: HTMLElement, left: Float, top: Float, width: Float, height: Float
-) {
-    // language=javascript
-    js(
-        """
-       element.style.left = "" + left + "px";
-       element.style.top = "" + top + "px";
-       element.style.width = "" + width + "px";
-       element.style.height = "" + height + "px";
-    """
+private fun NodeList.asSequence(): Sequence<Node> = object : Sequence<Node> {
+    override fun iterator(): Iterator<Node> = object : Iterator<Node> {
+        var index = 0
+
+        override fun next(): Node = checkNotNull(item(index)).unsafeCast<Node>().also { index++ }
+        override fun hasNext(): Boolean = index < length
+
+    }
+}
+
+private external interface FocusListenerElement : JsAny {
+    var focusListener: EventListenerInterface?
+}
+
+private var HTMLElement.focusListener: EventListenerInterface?
+    get() = unsafeCast<FocusListenerElement>().focusListener.takeIf { it != undefined }
+    set(value) {
+        val self = unsafeCast<FocusListenerElement>()
+
+        self.focusListener?.also {
+            self.focusListener = undefined.unsafeCast<EventListenerInterface>()
+            removeEventListener("focus", it)
+        }
+
+        value?.also {
+            self.focusListener = it
+            addEventListener("focus", it)
+        }
+    }
+
+private external interface ClickListenerElement : JsAny {
+    var clickListener: EventListenerInterface?
+}
+
+private var HTMLElement.clickListener: EventListenerInterface?
+    get() = unsafeCast<ClickListenerElement>().clickListener.takeIf { it != undefined }
+    set(value) {
+        val self = unsafeCast<ClickListenerElement>()
+
+        self.clickListener?.also {
+            self.clickListener = undefined.unsafeCast<EventListenerInterface>()
+            removeEventListener("click", it)
+        }
+
+        value?.also {
+            self.clickListener = it
+            addEventListener("click", it)
+        }
+    }
+
+private external interface Checked : JsAny {
+    var checked: Boolean
+}
+
+private var HTMLElement.checked: Boolean
+    get() = unsafeCast<Checked>().checked
+    set(value) {
+        unsafeCast<Checked>().checked = value
+    }
+
+//typealias AnyEventHandler = EventHandler<*, *, *>
+
+private external interface EventTargetExtWrite : JsAny {
+    var addEventListener: (type: String, listener: EventListenerInterface, options: AddEventListenerOptions?) -> Unit
+    var removeEventListener: (type: String, listener: EventListenerInterface, options: AddEventListenerOptions?) -> Unit
+}
+
+private external interface EventTargetExtRead<T : EventTarget> : JsAny {
+    var addEventListener: EventTargetCallback<T>
+    var removeEventListener: EventTargetCallback<T>
+}
+
+private external interface EventTargetCallback<T : EventTarget> {
+    fun call(
+        self: T,
+        type: String,
+        listener: EventListenerInterface,
+        options: AddEventListenerOptions? = definedExternally
     )
 }
 
-internal object AriaRoleId {
-    const val Unknown = -1
+private data class EventListenerInfo(
+    val type: String,
+    val listener: EventListenerInterface,
+    val options: AddEventListenerOptions?,
+)
 
-    // Mapped from [androidx.compose.ui.semantics.Role] values:
-    const val Button = 0
-    const val Checkbox = 1
-    const val Switch = 2
-    const val RadioButton = 3
-    const val Tab = 4
-    const val Image = 5
-    const val DropdownList = 6
-    const val ValuePicker = Unknown // TODO: Any web alternative?
-    const val Carousel = Unknown // TODO: Any web alternative?
-
-    // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles
-    // Other ARIA roles not specified explicitly by [androidx.compose.ui.semantics.Role]:
-    const val Heading = 7
-    const val TextBox = 8
-    const val List = 9
-    const val Grid = 10
+private fun interface EventHandlerCaller {
+    fun callWithEvent(event: Event)
 }
 
-internal fun SemanticsConfiguration.getRoleId(): Int {
-    // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles
-    // Unfortunately, Role value is private, so we map it here:
-    fun Role.toIntId(): Int = when (this) {
-        Role.Button -> AriaRoleId.Button
-        Role.Checkbox -> AriaRoleId.Checkbox
-        Role.Switch -> AriaRoleId.Switch
-        Role.RadioButton -> AriaRoleId.RadioButton
-        Role.Tab -> AriaRoleId.Tab
-        Role.Image -> AriaRoleId.Image
-        Role.DropdownList -> AriaRoleId.DropdownList
-        Role.ValuePicker -> AriaRoleId.Unknown // TODO: Any web alternative?
-        Role.Carousel -> AriaRoleId.Unknown // TODO: Any web alternative?
-        else -> AriaRoleId.Unknown
+private fun EventHandlerCaller(canvas: HTMLCanvasElement): EventHandlerCaller {
+    // In order for the canvas to accept copy, paste, and other native events, they must be marked as trusted.
+    // When we manually re-dispatch events, they lose their trusted status (isTrusted = false) and stop working.
+    // As a workaround, we intercept calls to addEventListener and removeEventListener on the canvas,
+    // maintain our own collection of listeners, and invoke them directly so the original trusted events remain intact.
+
+    val map: MutableMap<EventListenerInterface, EventListenerInfo> =
+        mutableMapOf<EventListenerInterface, EventListenerInfo>()
+    val eventTarget = canvas.unsafeCast<EventTargetExtRead<HTMLCanvasElement>>()
+    val eventTargetWrite = canvas.unsafeCast<EventTargetExtWrite>()
+
+    val originalAddEventListener = eventTarget.addEventListener
+    eventTargetWrite.addEventListener = { type, listener, options ->
+        map[listener] = EventListenerInfo(type, listener, options)
+        originalAddEventListener.call(canvas, type, listener, options)
     }
 
-    var roleId = -1
-
-    if (this.contains(SemanticsProperties.Role)) {
-        roleId = this[SemanticsProperties.Role].toIntId()
+    val originalRemoveEventHandler = eventTarget.removeEventListener
+    eventTargetWrite.removeEventListener = { type, listener, options ->
+        map.remove(listener)
+        originalRemoveEventHandler.call(canvas, type, listener, options)
     }
 
-    if (this.contains(SemanticsActions.OnClick)) {
-        // TODO: Not everything with OnClick is a button!!!
-        roleId = Role.Button.toIntId()
-    }
-
-    if (this.contains(SemanticsProperties.Heading)) {
-        roleId = AriaRoleId.Heading
-    }
-
-    if (this.contains(SemanticsProperties.EditableText)) {
-        roleId = AriaRoleId.TextBox
-    }
-
-    if (this.contains(SemanticsProperties.CollectionInfo)) {
-        val info = this.get(SemanticsProperties.CollectionInfo)
-        roleId = if (info.columnCount > 1 && info.rowCount > 1) {
-            AriaRoleId.Grid
-        } else {
-            AriaRoleId.List
+    return EventHandlerCaller { event ->
+        for (info in map.values) {
+            if (info.type == event.type) {
+                if (handleEventInListener(info.listener)) {
+                    callHandleEvent(info.listener, event)
+                } else {
+                    call(info.listener, event)
+                }
+            }
         }
     }
-
-    return roleId
 }
 
-// To avoid passing a Kotlin string to JS, we pass an int instead and map it to String on the JS side.
-// See https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles
-internal fun setA11YAriaRole(element: HTMLElement, ariaRoleId: Int) {
-    // language=javascript
+private fun handleEventInListener(listener: EventListenerInterface): Boolean =
+    js(""""handleEvent" in listener""")
+
+private fun callHandleEvent(listener: EventListenerInterface, event: Event): Unit =
+    js("""listener.handleEvent(event)""")
+
+private fun call(listener: EventListenerInterface, event: Event): Unit = js("""listener(event)""")
+
+
+private fun isChrome(): Boolean = js("""typeof window.chrome !== "undefined"""")
+
+private fun setEventTimestamp(event: Event, timeStamp: JsNumber) {
     js(
-        """
-        var roleValue = "";
-        switch (ariaRoleId) {
-            case 0: // Role.Button
-                roleValue = "button";
-                break;
-            case 1: // Role.Checkbox
-                roleValue = "checkbox";
-                break;
-            case 2: // Role.Switch
-                roleValue = "switch";
-                break;
-            case 3: // Role.RadioButton
-                roleValue = "radio";
-                break;
-            case 4: // Role.Tab
-                roleValue = "tab";
-                break;
-            case 5: // Role.Image
-                roleValue = "img";
-                break;
-            case 6: // Role.DropdownList
-                roleValue = "menu";
-                break;
-            case 7: // heading https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/heading_role
-                roleValue = "heading";
-                break;
-            case 8: // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/textbox_role
-                roleValue = "textbox";
-                break;
-            case 9: // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/list_role
-                roleValue = "list";
-                break;
-            case 10: // https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Roles/grid_role
-                roleValue = "grid";
-                break;
-            default:
-                break;
-        }
-        if (roleValue.length > 0) { 
-            element.setAttribute("role", roleValue);
-        } else {
-            element.removeAttribute("role");
-        }
-    """
+        """try {
+            Object.defineProperty(event, 'timeStamp', {
+                value: timeStamp
+            });
+        } catch (err) {
+            // ignore
+        }"""
     )
 }
 
-private fun removeAllChildrenOf(element: HTMLElement) {
-    // language=javascript
-    js("element.replaceChildren()")
-}
+private fun copyInputEvent(event: InputEvent): InputEvent = InputEvent(
+    event.type,
+    //TODO inputType ?
+    InputEventInit(
+        data = event.data,
+        bubbles = true,
+        cancelable = true,
+    )
+)
+
+private fun copyKeyboardEvent(event: KeyboardEvent): KeyboardEvent =
+    js(
+        """new KeyboardEvent(event.type, {
+            key: event.key,
+            code: event.code,
+            location: event.location,
+            ctrlKey: event.ctrlKey,
+            shiftKey: event.shiftKey,
+            altKey: event.altKey,
+            metaKey: event.metaKey,
+            repeat: event.repeat,
+            isComposing: event.isComposing,
+            bubbles: true,
+            cancelable: true
+        })"""
+    )
+
+private fun isClipboardEventTrigger(event: KeyboardEvent) =
+    (event.metaKey || event.ctrlKey) && (event.key == "c" || event.key == "v" || event.key == "x")
+
+private fun EventListener(handler: (Event) -> Unit): EventListenerInterface =
+    js("(event) => { handler(event) }")
+
+private val undefined: JsAny = js("""undefined""")
